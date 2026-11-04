@@ -1,12 +1,16 @@
 import siteMetadata from '@/data/siteMetadata';
 
-const formatDate = (date: string) => {
-  const options: Intl.DateTimeFormatOptions = {
+const formatDate = (date: string, options: Intl.DateTimeFormatOptions = {}) => {
+  const [year, month, day] = date.slice(0, 10).split('-').map(Number);
+  const utcNoon = new Date(Date.UTC(year, month - 1, day, 12));
+
+  const now = utcNoon.toLocaleDateString(siteMetadata.locale, {
     year: 'numeric',
     month: 'long',
     day: 'numeric',
-  };
-  const now = new Date(date).toLocaleDateString(siteMetadata.locale, options);
+    timeZone: 'America/Los_Angeles',
+    ...options,
+  });
 
   return now;
 };

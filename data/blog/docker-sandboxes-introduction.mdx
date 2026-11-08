@@ -1,0 +1,671 @@
+---
+title: 'Introduction to Docker Sandboxes with Go'
+date: '2026-10-15'
+tags: ['docker', 'go', 'ai', 'security']
+draft: false
+summary: 'Running AI agents in isolated microVMs, from the sbx CLI and Go'
+images: ['/static/blogs/docker-sandboxes-introduction.png']
+authors: ['default']
+---
+AI coding agents are at their best when we let them work on their own, installing packages, running tests, building images, and trying things out without asking for permission every step of the way. But that's also when they're the most dangerous. An agent running on our laptop can do anything we can, including reading our SSH keys or wiping our home directory.
+
+Docker Sandboxes tries to solve exactly this. It gives each agent its own disposable machine to work in, with only the files, network access, and credentials we choose to share.
+
+In this article, we will look at what Docker Sandboxes are, why regular containers aren't enough, and how sandboxes work under the hood. Then we'll get hands-on with the `sbx` CLI on a Go project, use Cloud Sandboxes from a Go program, and go over some of the limitations.
+
+## Table of Contents
+
+- [Table of Contents](#table-of-contents)
+- [What Are Docker Sandboxes?](#what-are-docker-sandboxes)
+- [Why Do We Need Them?](#why-do-we-need-them)
+- [Why Not Just Use a Container?](#why-not-just-use-a-container)
+- [How It Works](#how-it-works)
+	- [MicroVMs](#microvms)
+	- [A Private Docker Engine](#a-private-docker-engine)
+	- [Workspaces](#workspaces)
+	- [Network Policy](#network-policy)
+	- [Credential Injection](#credential-injection)
+- [Getting Started](#getting-started)
+	- [Install and Sign In](#install-and-sign-in)
+	- [The First Sandbox](#the-first-sandbox)
+	- [Reaching the Go Module Proxy](#reaching-the-go-module-proxy)
+	- [Working in a Clone](#working-in-a-clone)
+	- [Running Unattended](#running-unattended)
+- [Using Cloud Sandboxes from Go](#using-cloud-sandboxes-from-go)
+	- [Authentication](#authentication)
+	- [Creating a Sandbox](#creating-a-sandbox)
+	- [Scoped Endpoint Credentials](#scoped-endpoint-credentials)
+	- [Running Code](#running-code)
+	- [Putting It Together](#putting-it-together)
+- [Local vs. Cloud](#local-vs-cloud)
+- [Limitations](#limitations)
+	- [What It Doesn't Protect Against](#what-it-doesnt-protect-against)
+	- [It Isn't Open Source](#it-isnt-open-source)
+- [Next Steps](#next-steps)
+
+## What Are Docker Sandboxes?
+
+A sandbox is an isolated environment for running code we don't fully trust. Whatever happens inside it stays inside it. If the code deletes files, installs something malicious, or goes off the rails, we just throw the sandbox away and nothing outside it is touched.
+
+Docker Sandboxes is Docker's product for doing this with AI coding agents. Each sandbox is a lightweight virtual machine (a microVM) with its own kernel, its own filesystem, and its own Docker Engine. A proxy on our machine decides which network destinations the agent can reach, and adds API keys to its requests so the agent never sees them.
+
+Sandboxes come in two flavors. Local sandboxes run on our own machine and are managed with a free CLI called `sbx`. Cloud sandboxes run the same isolation on Docker-managed infrastructure and can be created from code through the Sandboxes API.
+
+## Why Do We Need Them?
+
+Sandboxes are useful anywhere we want to let code run freely without trusting it:
+
+*   **Running coding agents unattended:** Claude Code, Codex, Gemini, Copilot, and other agents can install packages, run tests, and make changes without stopping to ask for approval at every step, because the sandbox bounds what they can do.
+
+*   **Trying risky changes safely:** an agent can work in a private clone of our repository, and we can review and fetch its commits like any other branch, or just delete them.
+
+*   **Agents in CI:** a pipeline can hand a task to an agent, such as fixing failing tests, and collect the result without giving it the runner's credentials.
+
+*   **Running untrusted code from applications:** platforms that execute tool calls, submitted code, or generated scripts can create a cloud sandbox per task and delete it afterward.
+
+## Why Not Just Use a Container?
+
+The obvious way to box in an agent is to just run it in a container. That works fine for trusted services, but agents end up hitting every weak spot a container has.
+
+First, a container is an ordinary Linux process with a restricted view of the system. Namespaces limit what it can see and cgroups limit what it can use, but every container on a host shares the host's kernel. A kernel exploit from inside a container is an exploit against the host.
+
+Second, agents want to use Docker themselves. Building an image or running a test database means talking to a Docker Engine, and the usual way to give a container one is to mount the host's `/var/run/docker.sock`. Whatever can talk to that socket can start a privileged container that mounts the host's root filesystem, which makes it equivalent to root on the host.
+
+Third, agents need network access, but not all of it. An agent that needs `proxy.golang.org` and an LLM API has no business reaching our internal services or a cloud metadata endpoint, and `--network none` is too blunt to express that.
+
+Finally, agents need credentials. An API key passed in as an environment variable is readable by every process in the container, including anything the agent installs or any prompt injection that tells it to print its environment.
+
+## How It Works
+
+Docker Sandboxes addresses each of these with a separate layer. The microVM is the primary trust boundary, and everything else narrows what crosses it.
+
+### MicroVMs
+
+Every sandbox runs in its own lightweight virtual machine with its own kernel, isolated from the host by the hypervisor rather than by kernel namespaces. It shares no memory or processes with the host.
+
+Inside the VM, the agent has full control, including `sudo`. That's deliberate: the agent can install whatever it needs without that freedom extending past the VM. Locally, sandboxes use the host's native virtualization, such as KVM on Linux and the Windows Hypervisor Platform on Windows.
+
+### A Private Docker Engine
+
+Each sandbox gets its own Docker Engine, with its own image cache and containers. There's no path from it to the host's daemon, so an agent can build images and run `docker compose up` without ever touching the socket that controls our machine.
+
+The flip side is that sandboxes don't share images or layers. Each one pulls what it needs into its own cache.
+
+### Workspaces
+
+Of course, the sandbox needs access to our code, and there are three ways to give it that:
+
+*   **Direct mode** mounts a host directory at the same absolute path inside the sandbox. Changes are visible in both directions immediately, with no sync step. This is what `sbx run` does with the current directory by default.
+
+*   **Clone mode** mounts the host repository read-only at `/run/sandbox/source`, and the agent works in a private Git clone inside the sandbox. Its changes stay there until we fetch them.
+
+*   **No workspace** mounts nothing from the host. Files live only inside the sandbox and are deleted with it.
+
+Direct mode is the most convenient and the least isolated: whatever the agent writes lands on our real files. Clone mode costs us a `git fetch`, but keeps our working tree untouched until we decide to take the changes.
+
+### Network Policy
+
+All outbound TCP traffic from a sandbox leaves through a proxy on the host. HTTP and HTTPS go through a forward proxy, other TCP is forwarded transparently, and both paths check the destination against a network policy before letting anything out.
+
+The default is deny: outbound HTTP, HTTPS, and SSH are blocked unless a rule allows the destination, UDP is off, ICMP is blocked, and DNS goes through a resolver inside the sandbox that enforces the same policy. Sandboxes can't reach each other directly either.
+
+Policies come from presets. **Balanced** allows common development services, while **Locked Down** requires an explicit rule for every destination.
+
+### Credential Injection
+
+The network proxy is also how credentials reach the outside world without entering the VM:
+
+1.  The agent sends a request with a placeholder value where the API key would go.
+
+2.  The request leaves the microVM and reaches the host-side proxy.
+
+3.  The proxy checks the destination against the network policy.
+
+4.  If it's allowed, the proxy looks up the matching credential on the host and swaps it in for the placeholder.
+
+5.  The response comes back through the proxy to the agent.
+
+The real key never exists inside the sandbox. An agent tricked into printing its environment or uploading its config files has nothing useful to leak.
+
+## Getting Started
+
+Locally, Docker Sandboxes is driven by a standalone CLI called `sbx`. The local CLI and local compute are free, including for commercial use. The examples below run an agent on a Go project, but nothing about the setup is Go-specific apart from the module proxy rules.
+
+### Install and Sign In
+
+On macOS (Sonoma 14 or later, Apple silicon), `sbx` comes from Docker's Homebrew tap:
+
+```bash
+brew trust docker/tap
+brew install docker/tap/sbx
+```
+
+On Ubuntu 24.04 or later, it ships alongside Docker Engine. KVM has to be available and our user has to be in the `kvm` group:
+
+```bash
+curl -fsSL https://get.docker.com | sudo SBX=1 sh
+sudo usermod -aG kvm $USER
+```
+
+On Windows 11, it's `winget install -h Docker.sbx`, with the Windows Hypervisor Platform feature enabled.
+
+Then, let's sign in with our Docker account:
+
+```bash
+sbx login
+```
+
+### The First Sandbox
+
+Now, from the root of a Go project, let's start an agent:
+
+```bash
+cd ~/code/my-service
+sbx run --name my-service claude
+```
+
+The first run pulls the agent's image, so it takes a while. After that, sandboxes start in seconds. If no network policy has been set up yet, the CLI asks for a preset; Balanced is the sensible starting point.
+
+Claude Code is one of several supported agents, alongside Codex, Copilot, Gemini, Kiro, OpenCode, and others. There's also a `shell` agent, which is a sandbox with no agent in it, useful for setting up an environment by hand.
+
+For Claude Code with a Claude subscription, running `/login` inside the sandbox signs in over OAuth, and the session token stays on the host. For tools that need GitHub access, `sbx` can read a token from the host's `gh` CLI and store it as a secret that the proxy injects:
+
+```bash
+sbx secret set github --command 'gh auth token'
+```
+
+From another terminal, `sbx ls` shows what's running and what it can touch:
+
+```
+SANDBOX      AGENT    STATUS      PORTS   WORKSPACE         CREATED
+my-service   claude   ● running           ~/code/my-service 2m
+```
+
+`sbx exec` runs commands inside the sandbox, in the primary workspace, and returns the command's exit code. That's the quickest way to check whether the toolchain is there:
+
+```bash
+sbx exec my-service -- go version
+sbx exec my-service -- go test ./...
+sbx exec -it my-service bash
+```
+
+If the agent's image doesn't include the Go version we need, we can install it inside the sandbox. The agent has `sudo`, and installed packages persist across stops and restarts. To avoid repeating that in every new sandbox, save the configured sandbox as a template and start from it next time:
+
+```bash
+sbx template save my-service go-agent:v1
+sbx run -t go-agent:v1 --name another-service claude
+```
+
+A Go service running in the sandbox can be reached from the host by publishing its port, the same way `docker run -p` works:
+
+```bash
+sbx ports my-service --publish 8080:8080
+```
+
+### Reaching the Go Module Proxy
+
+`go build` and `go test` download modules on first use, which means the sandbox needs to reach Go's module proxy and checksum database. The Balanced preset may already allow them, and `sbx policy ls` shows the active rules.
+
+Under Locked Down, or if a download fails, we can allow them explicitly:
+
+```bash
+sbx policy allow network proxy.golang.org
+sbx policy allow network sum.golang.org
+```
+
+If our project uses private modules, `GOPRIVATE` makes `go` fetch them directly from our Git host instead. That host needs its own rule, and the credentials for it can come from `sbx secret` so they're injected by the proxy rather than written into the sandbox.
+
+It's better to allow specific hosts than to switch to a looser preset. Every allowed destination is a channel the agent's actions can travel over, and a broad wildcard like `*.googleapis.com` covers far more than any one API.
+
+### Working in a Clone
+
+In direct mode, every file the agent writes is a file on our machine. For anything more than a small change, clone mode keeps the agent's work separate until we've reviewed it:
+
+```bash
+sbx run --clone --name refactor claude .
+```
+
+The agent commits in its own clone inside the sandbox. On the host, `sbx` adds a Git remote named `sandbox-refactor`, so pulling its work back is an ordinary fetch:
+
+```bash
+git fetch sandbox-refactor
+git branch -r --list 'sandbox-refactor/*'
+git diff main sandbox-refactor/<branch>
+```
+
+From there, we can merge, cherry-pick, or throw it away, the same as any other branch. Removing the sandbox removes the remote too:
+
+```bash
+sbx rm refactor
+```
+
+### Running Unattended
+
+The same commands work in CI, where there's no browser and no terminal for prompts. Sign in with a personal access token, import the agent's API key from the CI environment as a secret, and drive the agent with `sbx exec`:
+
+```bash
+echo "$DOCKER_PAT" | sbx login --username "$DOCKER_ID" --password-stdin
+sbx secret import --all
+
+sbx create --name ci-task --clone claude .
+sbx exec ci-task -- claude --dangerously-skip-permissions -p "Fix the failing tests in ./internal/store and make sure go test ./... passes"
+sbx exec ci-task -- go test ./...
+
+git fetch sandbox-ci-task
+sbx rm --force ci-task
+```
+
+`--dangerously-skip-permissions` is a flag we'd never want to use on our own machine. But inside a sandbox, it's exactly what we want, because the agent works without stopping to ask, and the microVM, network policy, and clone mode bound what that freedom can do.
+
+`sbx exec` passes through the exit code of the command it ran, so a failing `go test` fails the CI step. Exit code 125 means the command couldn't run at all, such as a missing sandbox, and 127 means the executable wasn't found inside it. Commands that would normally ask for confirmation need `--force`, since piping `yes` into them doesn't work without a terminal.
+
+## Using Cloud Sandboxes from Go
+
+Local sandboxes are built for a developer at a terminal. Cloud Sandboxes run the same microVM isolation on Docker-managed infrastructure, which makes them a fit for applications that need to run untrusted code on demand: an agent platform executing tool calls, a coding playground, or a grader for submitted code.
+
+Docker ships a TypeScript SDK for this, but the Sandboxes API underneath is plain REST with a published OpenAPI spec, so a Go client is about two hundred lines of `net/http`. Cloud compute is pay-as-you-go and needs a Docker Agentic Platform subscription.
+
+The API is split across two surfaces:
+
+*   The **management API**, at `https://connect.docker.com/sandboxes`, creates, reads, and deletes sandboxes using an account-level token.
+
+*   Each sandbox's own **endpoint** runs commands and reads and writes files, and only accepts a short-lived token scoped to that one sandbox.
+
+### Authentication
+
+The management API doesn't take a personal access token directly. The PAT, created with **Allow Cloud Sandboxes access** selected, is exchanged with Docker Hub for an access token first:
+
+```go
+const (
+	hubTokenURL = "https://hub.docker.com/v2/auth/token"
+	apiBaseURL  = "https://connect.docker.com/sandboxes"
+)
+
+type Client struct {
+	http  *http.Client
+	token string
+}
+
+// Login exchanges a Docker ID and personal access token for an access token.
+// The PAT itself is never sent to the Sandboxes API.
+func Login(ctx context.Context, dockerID, pat string) (*Client, error) {
+	c := &Client{http: &http.Client{Timeout: 2 * time.Minute}}
+
+	body := map[string]string{"identifier": dockerID, "secret": pat}
+	var resp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := c.do(ctx, http.MethodPost, hubTokenURL, "", body, &resp); err != nil {
+		return nil, fmt.Errorf("login: %w", err)
+	}
+
+	c.token = resp.AccessToken
+	return c, nil
+}
+```
+
+Every call in the client goes through one helper. It sends JSON or raw bytes, adds the bearer token, and turns error responses into a typed error, since the API returns a stable `code` alongside a human-readable `message`:
+
+```go
+type APIError struct {
+	Status  int    `json:"-"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("sandboxes: %s: %s", e.Code, e.Message)
+}
+
+func (c *Client) do(ctx context.Context, method, target, token string, in, out any) error {
+	var body io.Reader
+	contentType := ""
+
+	switch v := in.(type) {
+	case nil:
+	case []byte:
+		body, contentType = bytes.NewReader(v), "application/octet-stream"
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		body, contentType = bytes.NewReader(b), "application/json"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		return err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		apiErr := &APIError{Status: resp.StatusCode}
+		json.NewDecoder(resp.Body).Decode(apiErr)
+		return apiErr
+	}
+	if out == nil || resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+```
+
+Matching on `Code` rather than the HTTP status is what the API recommends: several distinct failures can share a status, but each has its own code.
+
+### Creating a Sandbox
+
+A sandbox can be created from a bundled kit, a prepared image, or any registry image. For running Go, the official `golang` image is the simplest choice:
+
+```go
+type Resources struct {
+	CPUs      int `json:"cpus"`
+	MemoryMiB int `json:"memoryMib"`
+}
+
+type Sandbox struct {
+	Name    string    `json:"name"` // "sandboxes/<uid>"
+	Failure *APIError `json:"failure,omitempty"`
+	Core    struct {
+		Status   string `json:"status"`
+		Endpoint struct {
+			URI string `json:"uri"`
+		} `json:"endpoint"`
+	} `json:"core"`
+}
+
+func (c *Client) CreateSandbox(ctx context.Context, imageRef string, res Resources) (*Sandbox, error) {
+	body := map[string]any{
+		"imageRef":  imageRef,
+		"resources": res,
+	}
+
+	var sbx Sandbox
+	if err := c.do(ctx, http.MethodPost, apiBaseURL+"/v1/sandboxes", c.token, body, &sbx); err != nil {
+		return nil, fmt.Errorf("create sandbox: %w", err)
+	}
+	return &sbx, nil
+}
+```
+
+Requests made directly against the API have to set both `cpus` and `memoryMib`, and unsupported pairs, like 1 CPU with 1 GiB, are rejected. The SDK's named sizes are the safe pairs to use:
+
+| Size     | CPUs | Memory |
+| -------- | ---- | ------ |
+| `micro`  | 1    | 2 GiB  |
+| `small`  | 2    | 4 GiB  |
+| `medium` | 4    | 8 GiB  |
+| `large`  | 8    | 16 GiB |
+| `xl`     | 16   | 32 GiB |
+
+The server assigns each sandbox a name of the form `sandboxes/<uid>`, which never changes and doubles as its URL path. That's why the client appends `Name` directly to `/v1/` rather than building the path itself.
+
+Creation is asynchronous. The create call returns `202 Accepted` with the sandbox in `creating`, and there's no dedicated wait operation, so the client polls until it's `running` or has failed:
+
+```go
+// WaitRunning polls until the sandbox is running. Creation is asynchronous,
+// and there's no dedicated wait operation, so reading the resource is the
+// only way to know when it's ready.
+func (c *Client) WaitRunning(ctx context.Context, name string) (*Sandbox, error) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		sbx, err := c.GetSandbox(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+
+		switch sbx.Core.Status {
+		case "running":
+			return sbx, nil
+		case "failed":
+			if sbx.Failure != nil {
+				return nil, sbx.Failure
+			}
+			return nil, fmt.Errorf("sandbox %s failed", name)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Client) GetSandbox(ctx context.Context, name string) (*Sandbox, error) {
+	var sbx Sandbox
+	if err := c.do(ctx, http.MethodGet, apiBaseURL+"/v1/"+name, c.token, nil, &sbx); err != nil {
+		return nil, err
+	}
+	return &sbx, nil
+}
+
+func (c *Client) DeleteSandbox(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, apiBaseURL+"/v1/"+name, c.token, nil, nil)
+}
+```
+
+The `running` sandbox carries the one field the next step needs: `core.endpoint.uri`, the base URL of that sandbox's own API. It can change if the sandbox's runtime changes, so it's read fresh from the sandbox rather than cached.
+
+### Scoped Endpoint Credentials
+
+The account token can create and delete sandboxes, but the sandbox endpoint won't accept it. Running a command needs a separate credential, issued by the management API, scoped to one sandbox and to an explicit list of permissions, and valid for at most five minutes:
+
+```go
+// Session talks to one sandbox's own endpoint, using a short-lived
+// credential scoped to that sandbox instead of the account token.
+type Session struct {
+	client   *Client
+	endpoint string
+	token    string
+}
+
+func (c *Client) Connect(ctx context.Context, sbx *Sandbox) (*Session, error) {
+	body := map[string]any{
+		"permissions": []string{"sandboxesExec", "sandboxesFilesWrite"},
+	}
+
+	var cred struct {
+		Token      string    `json:"token"`
+		ExpireTime time.Time `json:"expireTime"`
+	}
+	target := apiBaseURL + "/v1/" + sbx.Name + "/endpoint-credentials"
+	if err := c.do(ctx, http.MethodPost, target, c.token, body, &cred); err != nil {
+		return nil, fmt.Errorf("endpoint credential: %w", err)
+	}
+
+	return &Session{
+		client:   c,
+		endpoint: strings.TrimSuffix(sbx.Core.Endpoint.URI, "/"),
+		token:    cred.Token,
+	}, nil
+}
+```
+
+The split limits the blast radius of a leak. A token that ends up in a log or a crash report can run commands in one sandbox for a few minutes, not create sandboxes across our account. Asking only for `sandboxesExec` and `sandboxesFilesWrite`, and not `sandboxesFilesRead`, narrows it further.
+
+The five-minute lifetime also means a long-running session has to refresh its credential. For this example, everything finishes well inside that window, but a longer-lived service would call `Connect` again before `ExpireTime`.
+
+### Running Code
+
+With a session, writing a file is a `PUT` of raw bytes, and running a command is a `POST` that blocks until the command finishes:
+
+```go
+func (s *Session) WriteFile(ctx context.Context, path string, data []byte) error {
+	q := url.Values{"path": {path}, "mode": {"420"}} // 0644
+	return s.client.do(ctx, http.MethodPut, s.endpoint+"/v1/files/content?"+q.Encode(), s.token, data, nil)
+}
+
+type ExecRequest struct {
+	Cmd        []string          `json:"cmd"`
+	Env        map[string]string `json:"env,omitempty"`
+	WorkingDir string            `json:"workingDir,omitempty"`
+}
+
+type ExecResult struct {
+	ExitCode   int    `json:"exitCode"`
+	Stdout     []byte `json:"stdout"` // base64 in JSON, decoded by encoding/json
+	Stderr     []byte `json:"stderr"`
+	Incomplete bool   `json:"incomplete"`
+}
+
+func (s *Session) Exec(ctx context.Context, req ExecRequest) (*ExecResult, error) {
+	var res ExecResult
+	if err := s.client.do(ctx, http.MethodPost, s.endpoint+"/v1/processes/exec", s.token, req, &res); err != nil {
+		return nil, fmt.Errorf("exec: %w", err)
+	}
+	return &res, nil
+}
+```
+
+`stdout` and `stderr` come back base64-encoded, since a program's output isn't guaranteed to be valid UTF-8. Declaring them as `[]byte` is enough for `encoding/json` to decode them automatically.
+
+`Incomplete` is the API's version of an output cap. When a command produces more output than the API retains, it keeps what it can, sets `incomplete`, and still reports the real exit code. The API returns this as a success on purpose. Exec isn't idempotent, and an error could tempt a client into retrying and running the command twice.
+
+The request has no timeout field, so the timeout belongs in the command itself. Wrapping it in coreutils `timeout` kills it inside the sandbox after a fixed duration, and the exit code (124) says why.
+
+### Putting It Together
+
+Here's the whole flow, from a Docker ID and PAT to the output of a Go program run in a fresh microVM:
+
+```go
+const program = `package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func main() {
+	fmt.Printf("hello from %s/%s, %d CPUs\n", runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
+}
+`
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	client, err := Login(ctx, os.Getenv("DOCKER_ID"), os.Getenv("DOCKER_PAT"))
+	if err != nil {
+		return err
+	}
+
+	sbx, err := client.CreateSandbox(ctx, "golang:1.25", Resources{CPUs: 2, MemoryMiB: 4096})
+	if err != nil {
+		return err
+	}
+	// Cloud sandboxes bill while they exist, so delete on every return path.
+	defer client.DeleteSandbox(context.WithoutCancel(ctx), sbx.Name)
+
+	sbx, err = client.WaitRunning(ctx, sbx.Name)
+	if err != nil {
+		return err
+	}
+
+	session, err := client.Connect(ctx, sbx)
+	if err != nil {
+		return err
+	}
+
+	if err := session.WriteFile(ctx, "/tmp/main.go", []byte(program)); err != nil {
+		return err
+	}
+
+	res, err := session.Exec(ctx, ExecRequest{
+		Cmd:        []string{"timeout", "60s", "go", "run", "main.go"},
+		WorkingDir: "/tmp",
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("exit code: %d\n", res.ExitCode)
+	fmt.Printf("stdout: %s", res.Stdout)
+	fmt.Printf("stderr: %s", res.Stderr)
+	return nil
+}
+```
+
+Two details in `run` are easy to get wrong.
+
+The work lives in `run` rather than `main` because `log.Fatal` calls `os.Exit`, which skips deferred functions. If `main` did the work and failed after creating the sandbox, the `defer` that deletes it would never run, and the sandbox would keep billing until its time-to-live ran out.
+
+The delete uses `context.WithoutCancel(ctx)`. If `run` is returning because the five-minute timeout fired, `ctx` is already cancelled, and a delete made with it would fail before leaving the process. `WithoutCancel` keeps the context's values but drops its cancellation, so cleanup still happens.
+
+The program uses only the standard library, so `go run` needs no network access. A program with dependencies would need the sandbox's network rules to allow the Go module proxy, and cloud sandboxes keep their own rules: local policies aren't copied over.
+
+## Local vs. Cloud
+
+The two backends share the isolation model and most of the CLI, but they're separate environments with separate state:
+
+|                      | Local                                | Cloud                                             |
+| -------------------- | ------------------------------------ | ------------------------------------------------- |
+| Compute              | Your machine                         | Docker-managed infrastructure                     |
+| Workspace            | Host directory mounts or a Git clone | No host access; upload files or clone inside      |
+| Ports                | Bound to host ports                  | Exposed through a public HTTPS URL                |
+| Secrets and policies | Local stores                         | Separate cloud stores, managed with `sbx --cloud` |
+| Lifetime             | Until removed                        | Until its time-to-live expires                    |
+| Cost                 | Free                                 | Pay-as-you-go compute                             |
+
+`sbx --cloud` runs the same commands against the cloud backend, and `sbx move` copies a sandbox's filesystem from one to the other. Processes, memory, host mounts, and secrets don't move with it.
+
+## Limitations
+
+Sandboxes remove a whole class of risk, but not all of it, and there are tradeoffs beyond security too.
+
+### What It Doesn't Protect Against
+
+The microVM keeps an agent away from our host. It doesn't make what the agent produces safe to use, and Docker's own security docs are explicit about the gaps:
+
+*   **Direct-mode edits land on our files:** anything that runs without being invoked by name, like Git hooks in `.git/hooks`, CI configs, `Makefile`, `go:generate` directives, and editor tasks, can carry the agent's changes out of the sandbox the next time we run something on the host. Git hooks don't even show up in `git diff`.
+
+*   **Allowed destinations are open channels:** if the policy allows a host, the agent can send anything to it.
+
+*   **Local stdio MCP servers:** these run on the host with our permissions, outside the sandbox.
+
+*   **Shared agent skills:** a sandbox that can write to the skills store can change instructions that other sandboxes load.
+
+Clone mode and narrow network rules take care of most of this, and reviewing what comes out of the sandbox before running it on our machine takes care of the rest.
+
+### It Isn't Open Source
+
+The `sbx` CLI and the virtual machine monitor behind it are proprietary. Docker [built its own VMM](https://www.docker.com/blog/why-microvms-the-architecture-behind-docker-sandboxes/) on each platform's native hypervisor rather than adapting an existing one, and the public [`docker/sbx-releases`](https://github.com/docker/sbx-releases) repository holds release binaries under an all-rights-reserved license, not source code. It's free to use, including commercially, but we can't audit, fork, or self-host it.
+
+Teams that need an open-source isolation layer can build on [Firecracker](https://firecracker-microvm.github.io/) or [Kata Containers](https://katacontainers.io/) for microVMs, or [gVisor](https://gvisor.dev/) for a user-space kernel. None of them include network policy, credential injection, or agent workflows out of the box, so we'd have to build those ourselves.
+
+## Next Steps
+
+In this article, we learned what Docker Sandboxes are, why containers alone aren't enough for AI agents, and how sandboxes use microVMs, a private Docker Engine, network policies, and credential injection to isolate them. We also ran an agent on a Go project with `sbx`, and used Cloud Sandboxes from Go through the Sandboxes API.
+
+The same pieces carry over to anything that runs code we didn't write. Agent platforms executing tool calls, CI jobs on untrusted pull requests, and coding playgrounds all come down to the same thing: give the code a disposable machine and only the access it needs.
+
+You can also review the resources below to keep learning:
+
+*   [Docker Sandboxes documentation](https://docs.docker.com/ai/sandboxes/)
+
+*   [Docker Sandboxes architecture](https://docs.docker.com/ai/sandboxes/architecture/)
+
+*   [Docker Sandboxes security model](https://docs.docker.com/ai/sandboxes/security/)
+
+*   [Sandboxes API reference](https://docs.docker.com/reference/api/sandboxes/latest/)
+
+*   [Sandboxes API authentication](https://docs.docker.com/ai/sandboxes-api/authentication/)
